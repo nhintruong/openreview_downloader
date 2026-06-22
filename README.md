@@ -122,7 +122,7 @@ ordl --head 20 --venue-id NeurIPS.cc/2025/Conference
 
 ### Search, grep, and regex workflows
 
-Search over title, authors, abstract, keywords, decision, venue, id, and paper number. `--search` and `--grep` are aliases; matching is case-insensitive by default.
+Search over title, authors, abstract, keywords, decision, venue, id, paper number, and (where available) dataset and code URLs. `--search` and `--grep` are aliases; matching is case-insensitive by default.
 
 Preview accepted papers matching a text query:
 
@@ -181,7 +181,7 @@ For scripts, agents, and crawlbots, use JSON Lines output while listing:
 ordl accepted --list --search diffusion --head 2 --format jsonl --venue-id NeurIPS.cc/2025/Conference
 ```
 
-The first JSON line is a summary with the number of matched and shown papers; each following line is one paper record with stable fields such as `id`, `number`, `decision`, `title`, `authors`, `pdf_path`, `match_count`, and `matches`.
+The first JSON line is a summary with the number of matched and shown papers; each following line is one paper record with stable fields such as `id`, `number`, `decision`, `title`, `authors`, `pdf_path`, `match_count`, and `matches`. Records also include `dataset_url`, `code_url`, and `croissant_file`; these are populated for the Datasets and Benchmarks Track (see below) and are empty strings for venues that don't provide them.
 
 JSONL keeps progress logs on stderr so stdout can be piped directly into tools:
 
@@ -213,6 +213,44 @@ ordl oral,spotlight --venue-id ICML.cc/2025/Conference
 ```
 
 You can use any other OpenReview venue ID in the same way.
+
+### Datasets and Benchmarks Track
+
+NeurIPS runs a separate Datasets and Benchmarks Track with its own venue id. It works exactly like the main Conference, just with a different `--venue-id`:
+
+```bash
+ordl accepted --venue-id NeurIPS.cc/2025/Datasets_and_Benchmarks_Track
+```
+
+Because the track is distinct from the main Conference, its papers are saved to their own folder so the two never collide:
+
+```
+downloads/
+├── neurips2025/                                # main Conference
+└── neurips2025_datasets_and_benchmarks_track/  # Datasets and Benchmarks Track
+```
+
+To grab both tracks, run the command twice with each venue id.
+
+Datasets and Benchmarks papers carry extra metadata that the CLI extracts automatically:
+
+- `dataset_url` – link to the dataset (often a Hugging Face, Kaggle, or GitHub URL)
+- `code_url` – link to the accompanying code repository
+- `croissant_file` – reference to the attached [Croissant](https://github.com/mlcommons/croissant) metadata file
+
+`dataset_url` and `code_url` are searchable, so you can filter the track by them. For example, list every paper whose dataset is hosted on Hugging Face:
+
+```bash
+ordl accepted --list --search huggingface --venue-id NeurIPS.cc/2025/Datasets_and_Benchmarks_Track
+```
+
+In text output these appear as `dataset:` and `code:` lines under each paper; in `--format jsonl` they are fields on every record (empty strings for venues that don't provide them).
+
+### Metadata manifest
+
+When downloading (i.e. not `--list`), the CLI also writes a `metadata.jsonl` manifest into the output directory, for example `downloads/neurips2025_datasets_and_benchmarks_track/metadata.jsonl`. It contains one JSON record per selected paper — the same schema as `--list --format jsonl` — including the `dataset_url`, `code_url`, and `croissant_file` fields. This persists the metadata (and dataset links) alongside the PDFs instead of only printing it.
+
+The manifest covers the whole current selection, including papers that were already present and skipped, and is rewritten on each run to reflect that run's selection (so narrowing with `--head` or a search produces a manifest for just those papers).
 
 
 ### CLI Options

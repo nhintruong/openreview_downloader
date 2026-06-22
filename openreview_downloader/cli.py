@@ -5,10 +5,18 @@ import json
 import os
 import re
 import sys
+import time
+from collections import deque
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Pattern, Sequence, Tuple
+from typing import Deque, Dict, Iterable, List, Optional, Pattern, Sequence, Tuple
 
 from tqdm import tqdm
+
+# OpenReview throttles the /attachment endpoint. The observed anonymous limit is
+# 10 requests per 60s window; pacing under it avoids tripping HTTP 429 at all.
+DEFAULT_REQUESTS_PER_MINUTE = int(os.environ.get("ORDL_REQUESTS_PER_MINUTE", "10"))
+DEFAULT_MAX_RETRIES = int(os.environ.get("ORDL_MAX_RETRIES", "5"))
+RATE_LIMIT_WINDOW_SECONDS = 60.0
 
 # Environment variables can override defaults.
 DEFAULT_VENUE_ID = os.environ.get("VENUE_ID", "NeurIPS.cc/2025/Conference")
@@ -25,6 +33,8 @@ SEARCHABLE_FIELDS = (
     "keywords",
     "venue",
     "venueid",
+    "dataset_url",
+    "code_url",
 )
 
 
@@ -48,6 +58,12 @@ def conference_dir(venue_id: str) -> Path:
     year = next((p for p in parts if p.isdigit()), "")
     if short_name and year:
         slug = f"{short_name}{year}".lower()
+        # Keep non-default tracks (e.g. the Datasets and Benchmarks Track) in
+        # their own folder so they don't collide with the main Conference.
+        year_index = parts.index(year)
+        track_parts = [p for p in parts[year_index + 1 :] if p and p != "Conference"]
+        if track_parts:
+            slug = f"{slug}_{'_'.join(track_parts)}".lower()
     else:
         slug = venue_id.replace("/", "_").lower()
     return Path("downloads") / slug
@@ -249,6 +265,27 @@ def parse_args() -> argparse.Namespace:
         default="text",
         help="Output format for --list (default: text).",
     )
+    parser.add_argument(
+        "--requests-per-minute",
+        type=parse_nonnegative_int,
+        default=DEFAULT_REQUESTS_PER_MINUTE,
+        metavar="N",
+        help=(
+            "Throttle PDF downloads to at most N per minute to avoid HTTP 429 "
+            "rate limiting (default: %(default)s; 0 disables pacing). "
+            "Env: ORDL_REQUESTS_PER_MINUTE."
+        ),
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=parse_nonnegative_int,
+        default=DEFAULT_MAX_RETRIES,
+        metavar="N",
+        help=(
+            "Retries per PDF when rate limited, backing off on the server's "
+            "reset hint (default: %(default)s). Env: ORDL_MAX_RETRIES."
+        ),
+    )
     parser.set_defaults(skip_existing=True)
 
     args = parser.parse_args()
@@ -293,6 +330,8 @@ def note_search_fields(note, category: str) -> List[Tuple[str, str]]:
         "keywords": content_value(note, "keywords"),
         "venue": content_value(note, "venue"),
         "venueid": content_value(note, "venueid"),
+        "dataset_url": content_value(note, "dataset_URL"),
+        "code_url": content_value(note, "code_URL"),
     }
     return [(field, fields[field]) for field in SEARCHABLE_FIELDS if fields[field]]
 
@@ -406,9 +445,26 @@ def paper_record(
         "venue": content_value(note, "venue"),
         "venueid": content_value(note, "venueid"),
         "pdf_path": str(path),
+        "dataset_url": content_value(note, "dataset_URL"),
+        "code_url": content_value(note, "code_URL"),
+        "croissant_file": content_value(note, "croissant_file"),
         "match_count": match_info["hit_count"] if match_info else 0,
         "matches": match_info["details"] if match_info else [],
     }
+
+
+def write_manifest(
+    path: Path,
+    selected: Sequence[Tuple[object, str, Path, Optional[Dict[str, object]]]],
+) -> None:
+    """Write one JSON line of metadata per selected paper, including dataset and
+    code URLs. Covers the whole selection so already-present PDFs are recorded
+    too. Overwrites any prior manifest for this run's selection."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for note, category, pdf_path, match_info in selected:
+            record = paper_record(note, category, pdf_path, match_info)
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def format_paper_line(note, category: str) -> str:
@@ -456,6 +512,12 @@ def print_selected(
             print(f"  authors: {authors}")
         print(f"  id: {getattr(note, 'id', '')}")
         print(f"  pdf: {path}")
+        dataset_url = content_value(note, "dataset_URL")
+        if dataset_url:
+            print(f"  dataset: {dataset_url}")
+        code_url = content_value(note, "code_URL")
+        if code_url:
+            print(f"  code: {code_url}")
         if match_info:
             for detail in match_info["details"]:
                 label = detail.get("query") or detail.get("pattern")
@@ -579,6 +641,64 @@ def print_info(venue_id: str, counts: Dict[str, int]) -> None:
     print(f"Rejected: {counts['rejected']}")
 
 
+class RateLimiter:
+    """Proactively pace requests to stay under N per rolling 60s window."""
+
+    def __init__(self, requests_per_minute: int) -> None:
+        self.requests_per_minute = max(0, requests_per_minute)
+        self.window: Deque[float] = deque()
+
+    def wait(self) -> None:
+        if self.requests_per_minute <= 0:
+            return
+        now = time.monotonic()
+        while self.window and now - self.window[0] >= RATE_LIMIT_WINDOW_SECONDS:
+            self.window.popleft()
+        if len(self.window) >= self.requests_per_minute:
+            sleep_for = RATE_LIMIT_WINDOW_SECONDS - (now - self.window[0])
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            self.window.popleft()
+        self.window.append(time.monotonic())
+
+
+def rate_limit_status(exc: Exception) -> Optional[Dict]:
+    """Return the error payload if exc is an OpenReview HTTP 429, else None."""
+    payload = exc.args[0] if exc.args else None
+    if isinstance(payload, dict) and payload.get("status") == 429:
+        return payload
+    return None
+
+
+def rate_limit_wait_seconds(payload: Dict, attempt: int) -> float:
+    """How long to back off after a 429, from the server hint or exponential fallback."""
+    match = re.search(r"try again in (\d+)\s*seconds", payload.get("message", ""))
+    if match:
+        return float(match.group(1)) + 1.0
+    return min(60.0, 2.0 ** attempt)
+
+
+def fetch_attachment(
+    client, note_id: str, limiter: RateLimiter, max_retries: int
+) -> bytes:
+    """Download one attachment, pacing requests and backing off on HTTP 429."""
+    for attempt in range(max_retries + 1):
+        limiter.wait()
+        try:
+            return client.get_attachment(field_name="pdf", id=note_id)
+        except Exception as exc:  # noqa: BLE001
+            payload = rate_limit_status(exc)
+            if payload is None or attempt == max_retries:
+                raise
+            sleep_for = rate_limit_wait_seconds(payload, attempt)
+            tqdm.write(
+                f"Rate limited on {note_id}; waiting {sleep_for:.0f}s "
+                f"(retry {attempt + 1}/{max_retries})"
+            )
+            time.sleep(sleep_for)
+    raise RuntimeError("unreachable")
+
+
 def status(message: str, args: argparse.Namespace) -> None:
     stream = sys.stderr if args.list and args.format == "jsonl" else sys.stdout
     print(message, file=stream)
@@ -635,6 +755,9 @@ def main() -> None:
         print(f"Head limit: first {len(selected_for_action)} selected papers")
     print(f"Already present: {already_present}. To download now: {len(to_download)}")
 
+    write_manifest(base_dir / "metadata.jsonl", selected_for_action)
+
+    limiter = RateLimiter(args.requests_per_minute)
     for note, category, path, _match_info in tqdm(
         to_download, desc="Downloading", unit="paper"
     ):
@@ -645,7 +768,9 @@ def main() -> None:
             continue
 
         try:
-            pdf_bytes = client.get_attachment(field_name="pdf", id=note.id)
+            pdf_bytes = fetch_attachment(
+                client, note.id, limiter, args.max_retries
+            )
         except Exception as exc:  # noqa: BLE001
             tqdm.write(f"Failed to fetch {note.id}: {exc}")
             continue
