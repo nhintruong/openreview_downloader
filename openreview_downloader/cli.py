@@ -38,17 +38,45 @@ SEARCHABLE_FIELDS = (
 )
 
 
-def build_client():
-    """Return an OpenReview client, optionally authenticated via env vars."""
+# OpenReview migrated to API v2 around 2024. Newer venues (NeurIPS 2023+,
+# ICLR 2024+) live on api2.openreview.net; older ones (e.g. ICLR 2023) are only
+# on the legacy v1 API at api.openreview.net, with a different data model.
+API_V2_BASEURL = "https://api2.openreview.net"
+API_V1_BASEURL = "https://api.openreview.net"
+# v1 stores submissions under an invitation rather than a venueid filter; the
+# name varies, so try the common ones in order.
+V1_SUBMISSION_INVITATIONS = ("Blind_Submission", "Submission")
+
+
+def build_client(venue_id: str) -> Tuple[object, int]:
+    """Return (client, api_version), auto-detecting whether the venue lives on
+    OpenReview API v2 or the legacy v1 API. Auth is optional via env vars."""
     import openreview
 
     username = os.environ.get("OPENREVIEW_USERNAME")
     password = os.environ.get("OPENREVIEW_PASSWORD")
-    return openreview.api.OpenReviewClient(
-        baseurl="https://api2.openreview.net",
-        username=username,
-        password=password,
+
+    client2 = openreview.api.OpenReviewClient(
+        baseurl=API_V2_BASEURL, username=username, password=password
     )
+    try:
+        if client2.get_notes(content={"venueid": venue_id}, limit=1):
+            return client2, 2
+    except Exception:  # noqa: BLE001 - fall through to the v1 probe
+        pass
+
+    client1 = openreview.Client(
+        baseurl=API_V1_BASEURL, username=username, password=password
+    )
+    for name in V1_SUBMISSION_INVITATIONS:
+        try:
+            if client1.get_notes(invitation=f"{venue_id}/-/{name}", limit=1):
+                return client1, 1
+        except Exception:  # noqa: BLE001 - try the next invitation name
+            continue
+
+    # Nothing found either way; default to v2 so behaviour matches the old tool.
+    return client2, 2
 
 
 def conference_dir(venue_id: str) -> Path:
@@ -97,14 +125,32 @@ def presentation_type(note) -> Optional[str]:
     venue_text = content_value(note, "venue").lower()
     decision_text = content_value(note, "decision").lower()
     combined = f"{venue_text} {decision_text}"
-    if "oral" in combined:
+    # ICLR 2023 (API v1) has no "oral"/"spotlight" labels; its top tiers are
+    # "notable top 5%" (oral-equivalent) and "notable top 25%" (spotlight).
+    if "oral" in combined or "notable top 5" in combined:
         return "oral"
-    if "spotlight" in combined:
+    if "spotlight" in combined or "notable top 25" in combined:
         return "spotlight"
     return None
 
 
-def note_decision(note, venue_id: str) -> Optional[str]:
+def note_decision_v1(note, venue_id: str) -> Optional[str]:
+    """Classify a legacy API v1 note. Every submission shares one venueid, so the
+    decision is read from the venue text: a still-"Submitted" (or withdrawn/desk
+    rejected) venue means rejected; anything else is an accepted tier."""
+    venue_text = content_value(note, "venue").lower()
+    if any(
+        marker in venue_text
+        for marker in ("submitted", "reject", "withdraw", "desk")
+    ):
+        return "rejected"
+    return presentation_type(note) or "accepted"
+
+
+def note_decision(note, venue_id: str, api_version: int = 2) -> Optional[str]:
+    if api_version == 1:
+        return note_decision_v1(note, venue_id)
+
     venueid = content_value(note, "venueid")
     label = presentation_type(note)
 
@@ -544,11 +590,32 @@ def split_existing(
     return to_download, existing
 
 
+def fetch_v1_submissions(client, venue_id: str) -> List:
+    """Fetch every submission for a legacy v1 venue under its submission
+    invitation (the name varies, so try the common ones in order)."""
+    for name in V1_SUBMISSION_INVITATIONS:
+        notes = client.get_all_notes(invitation=f"{venue_id}/-/{name}")
+        if notes:
+            return notes
+    return []
+
+
 def fetch_notes(
-    client, venue_id: str, need_rejected: bool
+    client, venue_id: str, need_rejected: bool, api_version: int = 2
 ) -> Tuple[List, List]:
+    if api_version == 1:
+        # v1 returns accepted and rejected together; split them by venue label.
+        accepted: List = []
+        rejected: List = []
+        for note in fetch_v1_submissions(client, venue_id):
+            if note_decision(note, venue_id, api_version=1) == "rejected":
+                rejected.append(note)
+            else:
+                accepted.append(note)
+        return accepted, rejected
+
     accepted = client.get_all_notes(content={"venueid": venue_id})
-    rejected: List = []
+    rejected = []
     if need_rejected:
         for suffix in REJECTED_SUFFIXES:
             rejected.extend(
@@ -558,11 +625,11 @@ def fetch_notes(
 
 
 def decision_counts(
-    accepted: Sequence, rejected: Sequence, venue_id: str
+    accepted: Sequence, rejected: Sequence, venue_id: str, api_version: int = 2
 ) -> Dict[str, int]:
     counts = {key: 0 for key in VALID_DECISIONS}
     for note in accepted:
-        label = note_decision(note, venue_id)
+        label = note_decision(note, venue_id, api_version)
         if label == "oral":
             counts["oral"] += 1
             counts["accepted"] += 1
@@ -572,7 +639,7 @@ def decision_counts(
         elif label == "accepted":
             counts["accepted"] += 1
     for note in rejected:
-        if note_decision(note, venue_id) == "rejected":
+        if note_decision(note, venue_id, api_version) == "rejected":
             counts["rejected"] += 1
     return counts
 
@@ -602,13 +669,14 @@ def collect_selected(
     venue_id: str,
     decisions: List[str],
     base_dir: Path,
+    api_version: int = 2,
 ) -> List[Tuple[object, str, Path]]:
     requested = set(decisions)
     selected = []
     seen_ids = set()
 
     for note in accepted:
-        label = note_decision(note, venue_id)
+        label = note_decision(note, venue_id, api_version)
         target = target_category(label, requested)
         if not target or note.id in seen_ids:
             continue
@@ -707,19 +775,21 @@ def status(message: str, args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
 
-    client = build_client()
+    client, api_version = build_client(args.venue_id)
     base_dir = args.out_dir or conference_dir(args.venue_id)
     if not args.info and not args.list:
         base_dir.mkdir(parents=True, exist_ok=True)
 
     need_rejected = args.info or "rejected" in args.decisions
     status(f"Fetching accepted submissions for {args.venue_id}...", args)
-    accepted, rejected = fetch_notes(client, args.venue_id, need_rejected)
+    accepted, rejected = fetch_notes(
+        client, args.venue_id, need_rejected, api_version
+    )
     status(f"Accepted submissions: {len(accepted)}", args)
     if need_rejected:
         status(f"Rejected submissions: {len(rejected)}", args)
 
-    counts = decision_counts(accepted, rejected, args.venue_id)
+    counts = decision_counts(accepted, rejected, args.venue_id, api_version)
     if args.info:
         print_info(args.venue_id, counts)
         return
@@ -730,6 +800,7 @@ def main() -> None:
         venue_id=args.venue_id,
         decisions=args.decisions,
         base_dir=base_dir,
+        api_version=api_version,
     )
     matched = filter_selected(selected, args)
     total_matches = len(matched)
@@ -762,7 +833,11 @@ def main() -> None:
         to_download, desc="Downloading", unit="paper"
     ):
         pdf_meta = note.content.get("pdf", {})
-        pdf_field_value = pdf_meta.get("value") if isinstance(pdf_meta, dict) else None
+        # v2 stores pdf as {"value": path}; v1 stores it as a plain path string.
+        if isinstance(pdf_meta, dict):
+            pdf_field_value = pdf_meta.get("value")
+        else:
+            pdf_field_value = pdf_meta
         if not pdf_field_value:
             tqdm.write(f"Skipping {note.id}: no pdf field")
             continue

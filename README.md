@@ -214,6 +214,16 @@ ordl oral,spotlight --venue-id ICML.cc/2025/Conference
 
 You can use any other OpenReview venue ID in the same way.
 
+### Older venues (legacy API)
+
+OpenReview migrated to its API v2 around 2024. Newer venues (NeurIPS 2023+, ICLR 2024+) are served by API v2, while older ones (e.g. ICLR 2023 and earlier) are only on the legacy API v1, which uses a different data model. The CLI auto-detects which API a venue lives on, so older venues work with the same commands:
+
+```bash
+ordl accepted --venue-id ICLR.cc/2023/Conference
+```
+
+On these legacy venues the top tiers map to the usual decisions: ICLR 2023's "notable top 5%" counts as `oral` and "notable top 25%" as `spotlight`.
+
 ### Datasets and Benchmarks Track
 
 NeurIPS runs a separate Datasets and Benchmarks Track with its own venue id. It works exactly like the main Conference, just with a different `--venue-id`:
